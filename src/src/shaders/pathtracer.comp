@@ -383,8 +383,8 @@ vec3 trace(Ray ray, int max_depth, inout uint random_state) {
 layout (local_size_x = 32, local_size_y = 32, local_size_z = 1) in;
 
 void main() {
-    const int ANTI_ALIASING_SAMPLES = 1024;
-    const int MAX_DEPTH = 5;
+    const int ANTI_ALIASING_SAMPLES = 16;
+    const int MAX_DEPTH = 4;
 
     uvec2 pixelCoords = gl_GlobalInvocationID.xy;
     if (pixelCoords.x >= ubo.camera.image_width || pixelCoords.y >= ubo.camera.image_height) {

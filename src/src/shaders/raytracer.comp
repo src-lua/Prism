@@ -10,6 +10,8 @@ struct Camera {
 
     uint image_width;
     uint image_height;
+
+    uint samples_per_pixel;
 };
 
 struct Material {
@@ -68,6 +70,24 @@ void set_face_normal(inout HitRecord rec, in Ray r, in vec3 outward_normal) {
     rec.front_face = dot(r.direction, outward_normal) < 0.0;
     rec.normal = rec.front_face ? outward_normal : -outward_normal;
 }
+
+struct trace_log {
+    // Cor local (ambiente + difusa + especular das luzes + emissão)
+    vec3 local_color; 
+    
+    // 0 = Caminho termina aqui (difuso ou miss)
+    // 1 = Refrata e Reflete (transparente)
+    // 2 = Apenas Reflete (espelho)
+    uint path;
+
+    // Dados do raio para o próximo passo
+    Ray reflection_ray;
+    Ray refraction_ray;
+
+    // Dados da colisão para obter material, normal, etc.
+    bool hit;
+    HitRecord rec;
+};
 
 // ========= BUFFERS (Bindings) =========
 layout(set = 0, binding = 0) buffer OutputBuffer { vec4 imageData[]; } outBuffer;
@@ -222,314 +242,182 @@ bool is_in_shadow(int light_index, inout HitRecord rec) {
 
     return false; // Not in shadow
 }
-vec3 trace1(Ray ray) {
-    HitRecord rec;
-    if (!hit_closest(ray, rec)) {
-        return ubo.camera.ambient_color; // Cor de fundo
+
+trace_log trace(Ray ray) {
+    trace_log t_log;
+    t_log.hit = hit_closest(ray, t_log.rec);
+
+    if (!t_log.hit) {
+        t_log.local_color = ubo.camera.ambient_color; // Cor de fundo
+        t_log.path = 0; // O caminho termina
+        return t_log;
     }
 
-    Material mat = materialBuffer.materials[rec.material_index];
-
-    // Calcula apenas a iluminação direta (ambiente, difusa, especular)
+    Material mat = materialBuffer.materials[t_log.rec.material_index];
     vec3 surface_color = mat.ambient * ubo.camera.ambient_color;
-    vec3 view_direction = normalize(ray.origin - rec.p);
+    vec3 view_direction = normalize(ray.origin - t_log.rec.p);
 
+    // Calcula iluminação direta (Difusa e Especular)
     for (int i = 0; i < lightBuffer.lights.length(); i++) {
-        Light light = lightBuffer.lights[i];
-
-        if (!is_in_shadow(i, rec)) {
-            vec3 light_direction = normalize(light.position - rec.p);
+        if (!is_in_shadow(i, t_log.rec)) {
+            Light light = lightBuffer.lights[i];
+            vec3 light_direction = normalize(light.position - t_log.rec.p);
             
             // Componente Difusa
-            float diffuse_intensity = max(dot(rec.normal, light_direction), 0.0);
+            float diffuse_intensity = max(dot(t_log.rec.normal, light_direction), 0.0);
             surface_color += mat.color * diffuse_intensity * light.color;
 
-            // Componente Especular
-            if (mat.specular != vec3(0.0)) {
-                vec3 reflection_direction = reflect(-light_direction, rec.normal);
-                float specular_intensity = pow(max(dot(view_direction, reflection_direction), 0.0), mat.shininess);
-                surface_color += mat.specular * specular_intensity * light.color;
+            // Componente Especular (Blinn-Phong)
+            if (mat.shininess > 0.0) {
+                 vec3 reflection_direction = reflect(-light_direction, t_log.rec.normal);
+                 float specular_intensity = pow(max(dot(view_direction, reflection_direction), 0.0), mat.shininess);
+                 surface_color += mat.specular * specular_intensity * light.color;
             }
         }
     }
-    
-    // Não há mais lógica de reflexão/refração aqui.
-    // Apenas retorna a cor da superfície iluminada.
-    return clamp(mat.emission + surface_color, 0.0, 1.0);
+
+    t_log.local_color = mat.emission + surface_color;
+    t_log.path = 0; // Por padrão, o caminho termina aqui
+
+    // Se o material for transparente/refrativo
+    if (mat.transparency < 1.0) {
+        t_log.path = 1; // Sinaliza para refratar e refletir
+        vec3 reflection_direction = reflect(ray.direction, t_log.rec.normal);
+        t_log.reflection_ray = Ray(t_log.rec.p + t_log.rec.normal * 1e-4, reflection_direction);
+
+        float refraction_ratio = t_log.rec.front_face ? (1.0 / mat.refraction_index) : mat.refraction_index;
+        float cos_theta = min(dot(-ray.direction, t_log.rec.normal), 1.0);
+        float sin_theta = sqrt(1.0 - cos_theta * cos_theta);
+
+        // Se não houver reflexão interna total, prepare o raio de refração
+        if (refraction_ratio * sin_theta <= 1.0) {
+            vec3 refraction_direction = refract(ray.direction, t_log.rec.normal, refraction_ratio);
+            t_log.refraction_ray = Ray(t_log.rec.p - t_log.rec.normal * 1e-4, refraction_direction);
+        }
+    }
+    // Se o material for refletivo (mas não transparente)
+    else if (mat.specular != vec3(0.0)) {
+        t_log.path = 2; // Sinaliza para refletir
+        vec3 reflection_direction = reflect(ray.direction, t_log.rec.normal);
+        t_log.reflection_ray = Ray(t_log.rec.p + t_log.rec.normal * 1e-4, reflection_direction);
+    }
+
+    return t_log;
 }
 
-vec3 trace2(Ray ray) {
-    HitRecord rec;
-    if (!hit_closest(ray, rec)) {
-        return ubo.camera.ambient_color; // Background color
+struct RayState {
+    Ray ray;
+    vec3 contribution; // Contribuição acumulada de cor para este caminho
+    uint depth;
+};
+
+vec3 render(Ray initial_ray, uint max_depth) {
+    vec3 final_color = vec3(0.0);
+
+    const int STACK_SIZE = 128;
+    RayState stack[STACK_SIZE];
+    int stack_ptr = 0;
+
+    // 1. Empilhar o raio inicial
+    if (stack_ptr < STACK_SIZE) {
+        stack[stack_ptr].ray = initial_ray;
+        // 'contribution' agora funciona como 'throughput' ou 'peso do caminho'.
+        // Ele carrega o fator de mistura acumulado (ex: ks, 1-opacity, etc.)
+        stack[stack_ptr].contribution = vec3(1.0);
+        stack[stack_ptr].depth = 0;
+        stack_ptr++;
     }
 
-    Material mat = materialBuffer.materials[rec.material_index];
+    // 2. Loop principal
+    while (stack_ptr > 0) {
+        stack_ptr--;
+        RayState current_state = stack[stack_ptr];
 
-    vec3 surface_color = mat.ambient * ubo.camera.ambient_color;
-    vec3 view_direction = normalize(ray.origin - rec.p);
+        if (current_state.depth >= max_depth) {
+            continue;
+        }
 
-    for (int i = 0; i < lightBuffer.lights.length(); i++) {
-        Light light = lightBuffer.lights[i];
+        trace_log t_log = trace(current_state.ray);
 
-        if (!is_in_shadow(i, rec)) {
-            vec3 light_direction = normalize(light.position - rec.p);
-            float diffuse_intensity = max(dot(rec.normal, light_direction), 0.0);
+        // Se o raio não atingiu nada, adicionamos a cor de fundo (ambiente)
+        // ponderada pela contribuição do caminho e terminamos este caminho.
+        if (!t_log.hit) {
+            final_color += current_state.contribution * ubo.camera.ambient_color;
+            continue;
+        }
 
-            surface_color += mat.color * diffuse_intensity * light.color;
+        // Se atingiu um objeto, começamos a aplicar a lógica de mistura.
+        Material mat = materialBuffer.materials[t_log.rec.material_index];
+        
+        // Separe a cor local em emissão e iluminação de superfície (difusa/especular/ambiente)
+        // t_log.local_color já contém a soma de tudo (exceto emissão, que é adicionada depois).
+        // Para simplificar, vamos chamar tudo de surface_illumination.
+        vec3 surface_illumination = t_log.local_color - mat.emission;
 
-            if (mat.specular == vec3(0.0)) {
-                continue; // No specular reflection
+
+        // 1. Adiciona a componente emissiva. A luz emitida não é afetada por blending.
+        final_color += current_state.contribution * mat.emission;
+
+        // 2. Lógica de mistura baseada no tipo de material.
+        
+        // CASO 1: TRANSPARENTE (Refrata e Reflete)
+        // Corresponde a `if (opacity < 1.0)` no C++
+        if (t_log.path == 1) {
+            // Fator de opacidade. No C++, `d`. Aqui, `transparency` é o valor de 0 a 1.
+            // Assumindo que `mat.transparency` é a opacidade (d).
+            float opacity = mat.transparency;
+
+            // Adiciona a contribuição da iluminação local, ATENUADA pela opacidade.
+            final_color += current_state.contribution * surface_illumination * opacity;
+
+            // Calcula o fator de reflexão de Fresnel (quanto reflete vs. refrata)
+            float cos_theta = min(dot(-current_state.ray.direction, t_log.rec.normal), 1.0);
+            float refraction_ratio = t_log.rec.front_face ? (1.0 / mat.refraction_index) : mat.refraction_index;
+            float reflectance = schlick(cos_theta, refraction_ratio);
+
+            // A contribuição restante (1.0 - opacity) será dividida entre reflexão e refração.
+            vec3 path_contribution = current_state.contribution * (1.0 - opacity);
+
+            // Empilhar raio de reflexão
+            if (reflectance > 0.0 && stack_ptr < STACK_SIZE) {
+                stack[stack_ptr].ray = t_log.reflection_ray;
+                // A contribuição é a do caminho * fator de reflexão * cor especular
+                stack[stack_ptr].contribution = path_contribution * reflectance * mat.specular;
+                stack[stack_ptr].depth = current_state.depth + 1;
+                stack_ptr++;
             }
-            vec3 reflection_direction = reflect(-light_direction, rec.normal);
-            float specular_intensity = pow(max(dot(view_direction, reflection_direction), 0.0), mat.shininess);
-            surface_color += mat.specular * specular_intensity * light.color;
-        }
-    }
 
-    vec3 final_color = mat.emission + surface_color;
-
-    if (mat.transparency < 1.0) {
-        float reflectance;
-        float refraction_ratio = rec.front_face ? (1.0 / mat.refraction_index) : mat.refraction_index;
-
-        float cosine = min(dot(-ray.direction, rec.normal), 1.0);
-        float sine = sqrt(1.0 - cosine * cosine);
-
-        if (sine * refraction_ratio > 1.0) {
-            reflectance = 1.0; // Total internal reflection
-        } else {
-            reflectance = schlick(cosine, refraction_ratio);
-        }
-
-        vec3 reflection_color = vec3(0.0);
-        vec3 refraction_color = vec3(0.0);
-
-        vec3 reflection_direction = reflect(ray.direction, rec.normal);
-        Ray reflection_ray = Ray(rec.p + rec.normal * 1e-4, reflection_direction);
-        reflection_color = trace1(reflection_ray);
-
-        if (reflectance < 1.0) {
-            vec3 refraction_direction = refract(ray.direction, rec.normal, refraction_ratio);
-            Ray refraction_ray = Ray(rec.p - rec.normal * 1e-4, refraction_direction);
-            refraction_color = trace1(refraction_ray);
-        }
-
-        vec3 transmitted_color = mix(refraction_color, reflection_color, reflectance);
-        final_color = mix(transmitted_color, final_color, mat.transparency);
-    }
-    else if (mat.specular != vec3(0.0)) {
-        vec3 reflection_direction = reflect(ray.direction, rec.normal);
-        Ray reflection_ray = Ray(rec.p + rec.normal * 1e-4, reflection_direction);
-        final_color = mix(final_color, trace1(reflection_ray), mat.specular);
-    }
-
-    return clamp(final_color, 0.0, 1.0);
-}
-
-vec3 trace3(Ray ray) {
-    HitRecord rec;
-    if (!hit_closest(ray, rec)) {
-        return ubo.camera.ambient_color; // Background color
-    }
-
-    Material mat = materialBuffer.materials[rec.material_index];
-
-    vec3 surface_color = mat.ambient * ubo.camera.ambient_color;
-    vec3 view_direction = normalize(ray.origin - rec.p);
-
-    for (int i = 0; i < lightBuffer.lights.length(); i++) {
-        Light light = lightBuffer.lights[i];
-
-        if (!is_in_shadow(i, rec)) {
-            vec3 light_direction = normalize(light.position - rec.p);
-            float diffuse_intensity = max(dot(rec.normal, light_direction), 0.0);
-
-            surface_color += mat.color * diffuse_intensity * light.color;
-
-            if (mat.specular == vec3(0.0)) {
-                continue; // No specular reflection
+            // Empilhar raio de refração
+            if (reflectance < 1.0 && stack_ptr < STACK_SIZE) {
+                 stack[stack_ptr].ray = t_log.refraction_ray;
+                 // A contribuição é a do caminho * fator de refração * cor do objeto
+                 stack[stack_ptr].contribution = path_contribution * (1.0 - reflectance) * mat.color;
+                 stack[stack_ptr].depth = current_state.depth + 1;
+                 stack_ptr++;
             }
-            vec3 reflection_direction = reflect(-light_direction, rec.normal);
-            float specular_intensity = pow(max(dot(view_direction, reflection_direction), 0.0), mat.shininess);
-            surface_color += mat.specular * specular_intensity * light.color;
         }
-    }
+        // CASO 2: REFLETIVO OPACO (Espelho)
+        // Corresponde a `else if (mat->ks.r > 0 ...)` no C++
+        else if (t_log.path == 2) {
+            // Fator de mistura é a cor especular (`ks` no C++)
+            vec3 specular_color = mat.specular;
 
-    vec3 final_color = mat.emission + surface_color;
-
-    if (mat.transparency < 1.0) {
-        float reflectance;
-        float refraction_ratio = rec.front_face ? (1.0 / mat.refraction_index) : mat.refraction_index;
-
-        float cosine = min(dot(-ray.direction, rec.normal), 1.0);
-        float sine = sqrt(1.0 - cosine * cosine);
-
-        if (sine * refraction_ratio > 1.0) {
-            reflectance = 1.0; // Total internal reflection
-        } else {
-            reflectance = schlick(cosine, refraction_ratio);
-        }
-
-        vec3 reflection_color = vec3(0.0);
-        vec3 refraction_color = vec3(0.0);
-
-        vec3 reflection_direction = reflect(ray.direction, rec.normal);
-        Ray reflection_ray = Ray(rec.p + rec.normal * 1e-4, reflection_direction);
-        reflection_color = trace2(reflection_ray);
-
-        if (reflectance < 1.0) {
-            vec3 refraction_direction = refract(ray.direction, rec.normal, refraction_ratio);
-            Ray refraction_ray = Ray(rec.p - rec.normal * 1e-4, refraction_direction);
-            refraction_color = trace2(refraction_ray);
-        }
-
-        vec3 transmitted_color = mix(refraction_color, reflection_color, reflectance);
-        final_color = mix(transmitted_color, final_color, mat.transparency);
-    }
-    else if (mat.specular != vec3(0.0)) {
-        vec3 reflection_direction = reflect(ray.direction, rec.normal);
-        Ray reflection_ray = Ray(rec.p + rec.normal * 1e-4, reflection_direction);
-        final_color = mix(final_color, trace2(reflection_ray), mat.specular);
-    }
-
-    return clamp(final_color, 0.0, 1.0);
-}
-
-vec3 trace4(Ray ray) {
-    HitRecord rec;
-    if (!hit_closest(ray, rec)) {
-        return ubo.camera.ambient_color; // Background color
-    }
-
-    Material mat = materialBuffer.materials[rec.material_index];
-
-    vec3 surface_color = mat.ambient * ubo.camera.ambient_color;
-    vec3 view_direction = normalize(ray.origin - rec.p);
-
-    for (int i = 0; i < lightBuffer.lights.length(); i++) {
-        Light light = lightBuffer.lights[i];
-
-        if (!is_in_shadow(i, rec)) {
-            vec3 light_direction = normalize(light.position - rec.p);
-            float diffuse_intensity = max(dot(rec.normal, light_direction), 0.0);
-
-            surface_color += mat.color * diffuse_intensity * light.color;
-
-            if (mat.specular == vec3(0.0)) {
-                continue; // No specular reflection
+            // Adiciona a iluminação local, ATENUADA pelo inverso da cor especular.
+            final_color += current_state.contribution * surface_illumination * (vec3(1.0) - specular_color);
+            
+            // Empilha o raio de reflexão com a contribuição da cor especular.
+            if (stack_ptr < STACK_SIZE) {
+                stack[stack_ptr].ray = t_log.reflection_ray;
+                stack[stack_ptr].contribution = current_state.contribution * specular_color;
+                stack[stack_ptr].depth = current_state.depth + 1;
+                stack_ptr++;
             }
-            vec3 reflection_direction = reflect(-light_direction, rec.normal);
-            float specular_intensity = pow(max(dot(view_direction, reflection_direction), 0.0), mat.shininess);
-            surface_color += mat.specular * specular_intensity * light.color;
         }
-    }
-
-    vec3 final_color = mat.emission + surface_color;
-
-    if (mat.transparency < 1.0) {
-        float reflectance;
-        float refraction_ratio = rec.front_face ? (1.0 / mat.refraction_index) : mat.refraction_index;
-
-        float cosine = min(dot(-ray.direction, rec.normal), 1.0);
-        float sine = sqrt(1.0 - cosine * cosine);
-
-        if (sine * refraction_ratio > 1.0) {
-            reflectance = 1.0; // Total internal reflection
-        } else {
-            reflectance = schlick(cosine, refraction_ratio);
+        // CASO 0: DIFUSO OPACO (Caminho termina aqui)
+        else {
+            // Adiciona toda a iluminação local, pois não há raios secundários para misturar.
+            final_color += current_state.contribution * surface_illumination;
         }
-
-        vec3 reflection_color = vec3(0.0);
-        vec3 refraction_color = vec3(0.0);
-
-        vec3 reflection_direction = reflect(ray.direction, rec.normal);
-        Ray reflection_ray = Ray(rec.p + rec.normal * 1e-4, reflection_direction);
-        reflection_color = trace3(reflection_ray);
-
-        if (reflectance < 1.0) {
-            vec3 refraction_direction = refract(ray.direction, rec.normal, refraction_ratio);
-            Ray refraction_ray = Ray(rec.p - rec.normal * 1e-4, refraction_direction);
-            refraction_color = trace3(refraction_ray);
-        }
-
-        vec3 transmitted_color = mix(refraction_color, reflection_color, reflectance);
-        final_color = mix(transmitted_color, final_color, mat.transparency);
-    }
-    else if (mat.specular != vec3(0.0)) {
-        vec3 reflection_direction = reflect(ray.direction, rec.normal);
-        Ray reflection_ray = Ray(rec.p + rec.normal * 1e-4, reflection_direction);
-        final_color = mix(final_color, trace3(reflection_ray), mat.specular);
-    }
-
-    return clamp(final_color, 0.0, 1.0);
-}
-
-
-vec3 trace5(Ray ray) {
-    HitRecord rec;
-    if (!hit_closest(ray, rec)) {
-        return ubo.camera.ambient_color; // Background color
-    }
-
-    Material mat = materialBuffer.materials[rec.material_index];
-
-    vec3 surface_color = mat.ambient * ubo.camera.ambient_color;
-    vec3 view_direction = normalize(ray.origin - rec.p);
-
-    for (int i = 0; i < lightBuffer.lights.length(); i++) {
-        Light light = lightBuffer.lights[i];
-
-        if (!is_in_shadow(i, rec)) {
-            vec3 light_direction = normalize(light.position - rec.p);
-            float diffuse_intensity = max(dot(rec.normal, light_direction), 0.0);
-
-            surface_color += mat.color * diffuse_intensity * light.color;
-
-            if (mat.specular == vec3(0.0)) {
-                continue; // No specular reflection
-            }
-            vec3 reflection_direction = reflect(-light_direction, rec.normal);
-            float specular_intensity = pow(max(dot(view_direction, reflection_direction), 0.0), mat.shininess);
-            surface_color += mat.specular * specular_intensity * light.color;
-        }
-    }
-
-    vec3 final_color = mat.emission + surface_color;
-
-    if (mat.transparency < 1.0) {
-        float reflectance;
-        float refraction_ratio = rec.front_face ? (1.0 / mat.refraction_index) : mat.refraction_index;
-
-        float cosine = min(dot(-ray.direction, rec.normal), 1.0);
-        float sine = sqrt(1.0 - cosine * cosine);
-
-        if (sine * refraction_ratio > 1.0) {
-            reflectance = 1.0; // Total internal reflection
-        } else {
-            reflectance = schlick(cosine, refraction_ratio);
-        }
-
-        vec3 reflection_color = vec3(0.0);
-        vec3 refraction_color = vec3(0.0);
-
-        vec3 reflection_direction = reflect(ray.direction, rec.normal);
-        Ray reflection_ray = Ray(rec.p + rec.normal * 1e-4, reflection_direction);
-        reflection_color = trace4(reflection_ray);
-
-        if (reflectance < 1.0) {
-            vec3 refraction_direction = refract(ray.direction, rec.normal, refraction_ratio);
-            Ray refraction_ray = Ray(rec.p - rec.normal * 1e-4, refraction_direction);
-            refraction_color = trace4(refraction_ray);
-        }
-
-        vec3 transmitted_color = mix(refraction_color, reflection_color, reflectance);
-        final_color = mix(transmitted_color, final_color, mat.transparency);
-    }
-    else if (mat.specular != vec3(0.0)) {
-        vec3 reflection_direction = reflect(ray.direction, rec.normal);
-        Ray reflection_ray = Ray(rec.p + rec.normal * 1e-4, reflection_direction);
-        final_color = mix(final_color, trace4(reflection_ray), mat.specular);
     }
 
     return clamp(final_color, 0.0, 1.0);
@@ -548,12 +436,60 @@ vec2 rand2(vec2 p) {
     );
 }
 
+float radical_inverse_base2(uint bits) {
+    bits = (bits << 16u) | (bits >> 16u);
+    bits = ((bits & 0x55555555u) << 1u) | ((bits & 0xAAAAAAAAu) >> 1u);
+    bits = ((bits & 0x33333333u) << 2u) | ((bits & 0xCCCCCCCCu) >> 2u);
+    bits = ((bits & 0x0F0F0F0Fu) << 4u) | ((bits & 0xF0F0F0F0u) >> 4u);
+    bits = ((bits & 0x00FF00FFu) << 8u) | ((bits & 0xFF00FF00u) >> 8u);
+    return float(bits) * 2.3283064365386963e-10; // / 0x100000000
+}
+
+// Gera o n-ésimo ponto da sequência de Hammersley bidimensional
+vec2 hammersley(uint i, uint N) {
+    // A primeira dimensão usa a fração i/N
+    // A segunda dimensão usa a inversão de radicais de 'i' na base 2
+    return vec2(float(i) / float(N), radical_inverse_base2(i));
+}
+
+// Uma função de hash de alta qualidade que combina múltiplas entradas.
+// Ela recebe as coordenadas do pixel e o índice da amostra para gerar um "ruído" único.
+uint hash(uvec2 pixel_coords, uint sample_index) {
+    // Começa combinando as coordenadas do pixel
+    uint seed = pixel_coords.x + pixel_coords.y * 1920u; // Use a largura da sua imagem aqui se quiser
+
+    // Mistura o índice da amostra para garantir que cada amostra seja diferente
+    seed = seed ^ (sample_index * 747796405u + 1013904223u);
+    
+    // Embaralha os bits (algoritmo de hash comum)
+    seed = (seed ^ 61u) ^ (seed >> 16u);
+    seed *= 9u;
+    seed = seed ^ (seed >> 4u);
+    seed *= 0x27d4eb2du;
+    seed = seed ^ (seed >> 15u);
+    return seed;
+}
+
+// Retorna um vec2 com números pseudo-aleatórios no intervalo [0, 1)
+vec2 rand2f(uvec2 pixel_coords, uint sample_index) {
+    // Gera o primeiro número aleatório
+    uint n1 = hash(pixel_coords, sample_index);
+    
+    // Para o segundo número, podemos simplesmente usar o primeiro como semente para o próximo,
+    // ou perturbar a semente original de forma simples.
+    // Usar uma semente levemente diferente (sample_index + 1) é uma boa prática.
+    uint n2 = hash(pixel_coords, sample_index + 1u);
+    
+    // Normaliza os resultados para o intervalo [0, 1)
+    return vec2(float(n1) / float(0xFFFFFFFFu), float(n2) / float(0xFFFFFFFFu));
+}
+
 // ========= MAIN PROGRAM =========
 layout (local_size_x = 32, local_size_y = 32, local_size_z = 1) in;
 
 void main() {
-    const int ANTI_ALIASING_SAMPLES = 16;
-    const int MAX_DEPTH = 5;
+    const uint ANTI_ALIASING_SAMPLES = ubo.camera.samples_per_pixel;
+    const uint MAX_DEPTH = 4;
 
     uvec2 pixelCoords = gl_GlobalInvocationID.xy;
     if (pixelCoords.x >= ubo.camera.image_width || pixelCoords.y >= ubo.camera.image_height) {
@@ -563,7 +499,8 @@ void main() {
 
     vec3 pixel_color = vec3(0.0);
     for (int i = 0; i < ANTI_ALIASING_SAMPLES; ++i) {
-        vec2 random_offset = rand2(pixelCoords + vec2(float(i), float(ANTI_ALIASING_SAMPLES-i))) - 0.5;
+        // vec2 random_offset = hammersley(uint(i), uint(ANTI_ALIASING_SAMPLES)) - 0.5;
+        vec2 random_offset = rand2f(pixelCoords, uint(i)) - 0.5;
 
         vec3 pixel_center = ubo.camera.pixel_00_loc + 
                             (ubo.camera.pixel_delta_u * pixelCoords.x) - 
@@ -577,7 +514,7 @@ void main() {
         vec3 ray_direction = normalize(sample_target - ray_origin);
         Ray sample_ray = Ray(ray_origin, ray_direction);
 
-        pixel_color += trace5(sample_ray);
+        pixel_color += render(sample_ray, MAX_DEPTH);
     }
     
     pixel_color /= float(ANTI_ALIASING_SAMPLES);

@@ -185,7 +185,7 @@ Color Scene::trace(const Ray& ray, int depth) const {
 
 void Scene::render_tile(std::vector<Color>& buffer, int start_y, int end_y, int& pixels_done, std::mutex& progress_mutex) const {
     const int ANTI_ALIASING_SAMPLES = 16;
-    const int MAX_DEPTH = 5;
+    const int MAX_DEPTH = 4;
     const int total_pixels_global = camera_.pixel_height * camera_.pixel_width;
     int last_progress_percent = -1;
 

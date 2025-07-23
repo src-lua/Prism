@@ -13,6 +13,8 @@ struct GPUCameraData {
     alignas(16) float ambient_color[3];
     uint32_t image_width;
     uint32_t image_height;
+
+    uint32_t samples_per_pixel;
 };
 
 struct GPUMaterial {

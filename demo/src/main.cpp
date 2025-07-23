@@ -47,11 +47,12 @@ int main() {
     try {
         Prism::SceneParser("./data/input/scene.yml").parse().render();
 
-        // RenderScene("./shaders/pathtracer.spv", "pathtracer");
-
         std::clog << "\n\n\n";
-
+        RenderScene("./shaders/pathtracer.spv", "pathtracer");
+        std::clog << "\n\n\n";
         RenderScene("./shaders/raytracer.spv", "raytracer");
+        std::clog << "\n\n\n";
+        RenderScene("./shaders/raytracer_recursive.spv", "raytracer_recursive");
 
     } catch (const std::exception& e) {
         Prism::Style::logError(e.what());

@@ -168,6 +168,8 @@ void VulkanRenderer::createBuffers(const Camera& camera, const std::vector<GPUOb
     camData.image_width = m_imageWidth;
     camData.image_height = m_imageHeight;
 
+    camData.samples_per_pixel = 16;
+
     vk::BufferCreateInfo cameraBufferInfo({}, sizeof(GPUCameraData), vk::BufferUsageFlagBits::eUniformBuffer, vk::SharingMode::eExclusive);
     VmaAllocationCreateInfo cameraAllocInfo = {};
     cameraAllocInfo.usage = VMA_MEMORY_USAGE_CPU_TO_GPU; // Buffer para transferir dados da CPU para a GPU

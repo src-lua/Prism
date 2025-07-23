@@ -1,0 +1,586 @@
+#version 450
+
+// ========= STRUCTS (mirroring c++ structs) =========
+struct Camera {
+    vec3 position;
+    vec3 pixel_delta_u;
+    vec3 pixel_delta_v;
+    vec3 pixel_00_loc;
+    vec3 ambient_color;
+
+    uint image_width;
+    uint image_height;
+};
+
+struct Material {
+    // Aligned to 16 bytes
+    vec3 color;
+    float refraction_index;
+
+    // Aligned to 16 bytes
+    vec3 ambient;
+    float transparency;
+
+    // Aligned to 16 bytes
+    vec3 specular;
+    float shininess;
+
+    vec3 emission;
+};
+
+struct SceneObject {
+    int type;
+    int material_index;
+    vec2 padding; // Padding for alignment
+
+    // Sphere data
+    vec3 center;
+    float radius;
+
+    // Plane data
+    vec3 point_on_plane;
+    vec3 normal;
+
+    mat4 transform;
+    mat4 inverse_transform; 
+    mat4 inverse_transpose_transform; 
+};
+
+struct Light {
+    vec3 position;
+    vec3 color;
+};
+
+struct HitRecord {
+    float t;
+    vec3 p;
+    vec3 normal;
+    bool front_face;
+    int material_index;
+};
+
+struct Ray {
+    vec3 origin;
+    vec3 direction;
+};
+
+void set_face_normal(inout HitRecord rec, in Ray r, in vec3 outward_normal) {
+    rec.front_face = dot(r.direction, outward_normal) < 0.0;
+    rec.normal = rec.front_face ? outward_normal : -outward_normal;
+}
+
+// ========= BUFFERS (Bindings) =========
+layout(set = 0, binding = 0) buffer OutputBuffer { vec4 imageData[]; } outBuffer;
+layout(set = 0, binding = 1) uniform UBO { Camera camera; } ubo;
+layout(set = 0, binding = 2) readonly buffer ObjectBuffer { SceneObject objects[]; } objectBuffer;
+layout(set = 0, binding = 3) readonly buffer MaterialBuffer { Material materials[]; } materialBuffer;
+layout(set = 0, binding = 4) readonly buffer LightBuffer { Light lights[]; } lightBuffer;
+
+// =========
+
+Ray transform_ray(Ray ray, mat4 transform) {
+    vec4 transformed_origin = transform * vec4(ray.origin, 1.0);
+    vec4 transformed_direction = transform * vec4(ray.direction, 0.0);
+    return Ray(transformed_origin.xyz, normalize(transformed_direction).xyz);
+}
+
+float schlick(float cosine, float refraction_index) {
+    float r0 = (1.0 - refraction_index) / (1.0 + refraction_index);
+    r0 = r0 * r0;
+    return r0 + (1.0 - r0) * pow(1.0 - cosine, 5.0);
+}
+
+// ========= INTERSECTION FUNCTIONS =========
+
+bool hit_sphere(in int object_index, in Ray ray, in float t_min, in float t_max, inout HitRecord rec) {
+    SceneObject s = objectBuffer.objects[object_index];
+    Ray transformed_ray = transform_ray(ray, s.inverse_transform);
+
+    vec3 oc = transformed_ray.origin - s.center;
+    float a = dot(transformed_ray.direction, transformed_ray.direction);
+    float half_b = dot(oc, transformed_ray.direction);
+    float c = dot(oc, oc) - s.radius * s.radius;
+    float discriminant = half_b * half_b - a * c;
+
+    if (discriminant < 0.0) {
+        return false;
+    }
+
+    float sqrt_discriminant = sqrt(discriminant);
+
+    float root = (-half_b - sqrt_discriminant) / a;
+
+    vec3 local_hit_point = transformed_ray.origin + root * transformed_ray.direction;
+    vec3 world_hit_point = vec3(s.transform * vec4(local_hit_point, 1.0));
+    float t_world = dot(world_hit_point - ray.origin, ray.direction);
+
+    if (t_world < t_min || t_world > t_max) {
+        root = (-half_b + sqrt_discriminant) / a;
+        local_hit_point = transformed_ray.origin + root * transformed_ray.direction;
+        world_hit_point = vec3(s.transform * vec4(local_hit_point, 1.0));
+        t_world = dot(world_hit_point - ray.origin, ray.direction);
+
+        if (t_world < t_min || t_world > t_max) {
+            return false;
+        }
+    }
+    
+    rec.t = t_world;
+    rec.p = world_hit_point;
+    
+    vec3 outward_normal_local = (local_hit_point - s.center) / s.radius;
+    vec3 outward_normal_world = normalize(vec3(s.inverse_transpose_transform * vec4(outward_normal_local, 0.0)));
+    
+    set_face_normal(rec, ray, outward_normal_world);
+    rec.material_index = s.material_index;
+
+    return true;
+}
+
+bool hit_plane(in int object_index, in Ray ray, in float t_min, in float t_max, inout HitRecord rec) {
+    SceneObject s = objectBuffer.objects[object_index];
+    Ray transformed_ray = transform_ray(ray, s.inverse_transform);
+
+    float denom = dot(transformed_ray.direction, s.normal);
+    if (abs(denom) < 1e-6) {
+        return false; // Ray is parallel to the plane
+    }
+    float t_local = dot(s.point_on_plane - transformed_ray.origin, s.normal) / denom;
+
+    if (t_local < 0.0) {
+        return false;
+    }
+
+    vec3 local_hit_point = transformed_ray.origin + t_local * transformed_ray.direction;
+    vec3 world_hit_point = vec3(s.transform * vec4(local_hit_point, 1.0));
+    float t_world = dot(world_hit_point - ray.origin, ray.direction);
+
+    if (t_world < t_min || t_world > t_max) {
+        return false;
+    }
+
+    rec.t = t_world;
+    rec.p = world_hit_point;
+    
+    vec3 outward_normal_world = normalize(vec3(s.inverse_transpose_transform * vec4(s.normal, 0.0)));
+    set_face_normal(rec, ray, outward_normal_world);
+    rec.material_index = s.material_index;
+
+    return true;
+}
+
+// ========= RAY TRACING FUNCTION =========
+
+bool hit_closest(Ray ray, inout HitRecord rec) {
+    bool hit = false;
+    float closest_t = 1.0 / 0.0; // Initialize to infinity
+
+    for (int i = 0; i < objectBuffer.objects.length(); i++) {
+        HitRecord temp_rec;
+        SceneObject obj = objectBuffer.objects[i];
+        if (obj.type == 0) { // Sphere
+            if (hit_sphere(i, ray, 1e-4, closest_t, temp_rec)) {
+                hit = true;
+                closest_t = temp_rec.t;
+                rec = temp_rec;
+            }
+        }
+        
+        else if (obj.type == 1) { // Plane
+            if (hit_plane(i, ray, 1e-4, closest_t, temp_rec)) {
+                hit = true;
+                closest_t = temp_rec.t;
+                rec = temp_rec;
+            }
+        }
+    }
+
+    return hit;
+}
+
+bool is_in_shadow(int light_index, inout HitRecord rec) {
+    Light light = lightBuffer.lights[light_index];
+    float light_distance = length(light.position - rec.p);
+    vec3 light_direction = normalize(light.position - rec.p);
+
+    Ray shadow_ray = Ray(rec.p + rec.normal * 1e-4, light_direction);
+    HitRecord shadow_rec;
+    for (int i = 0; i < objectBuffer.objects.length(); i++) {
+        SceneObject obj = objectBuffer.objects[i];
+        if (obj.type == 0) { // Sphere
+            if (hit_sphere(i, shadow_ray, 1e-4, light_distance, shadow_rec)) {
+                return true; // In shadow
+            }
+        }
+        
+        else if (obj.type == 1) { // Plane
+            if (hit_plane(i, shadow_ray, 1e-4, light_distance, shadow_rec)) {
+                return true; // In shadow
+            }
+        }
+    }
+
+    return false; // Not in shadow
+}
+vec3 trace1(Ray ray) {
+    HitRecord rec;
+    if (!hit_closest(ray, rec)) {
+        return ubo.camera.ambient_color; // Cor de fundo
+    }
+
+    Material mat = materialBuffer.materials[rec.material_index];
+
+    // Calcula apenas a iluminação direta (ambiente, difusa, especular)
+    vec3 surface_color = mat.ambient * ubo.camera.ambient_color;
+    vec3 view_direction = normalize(ray.origin - rec.p);
+
+    for (int i = 0; i < lightBuffer.lights.length(); i++) {
+        Light light = lightBuffer.lights[i];
+
+        if (!is_in_shadow(i, rec)) {
+            vec3 light_direction = normalize(light.position - rec.p);
+            
+            // Componente Difusa
+            float diffuse_intensity = max(dot(rec.normal, light_direction), 0.0);
+            surface_color += mat.color * diffuse_intensity * light.color;
+
+            // Componente Especular
+            if (mat.specular != vec3(0.0)) {
+                vec3 reflection_direction = reflect(-light_direction, rec.normal);
+                float specular_intensity = pow(max(dot(view_direction, reflection_direction), 0.0), mat.shininess);
+                surface_color += mat.specular * specular_intensity * light.color;
+            }
+        }
+    }
+    
+    // Não há mais lógica de reflexão/refração aqui.
+    // Apenas retorna a cor da superfície iluminada.
+    return clamp(mat.emission + surface_color, 0.0, 1.0);
+}
+
+vec3 trace2(Ray ray) {
+    HitRecord rec;
+    if (!hit_closest(ray, rec)) {
+        return ubo.camera.ambient_color; // Background color
+    }
+
+    Material mat = materialBuffer.materials[rec.material_index];
+
+    vec3 surface_color = mat.ambient * ubo.camera.ambient_color;
+    vec3 view_direction = normalize(ray.origin - rec.p);
+
+    for (int i = 0; i < lightBuffer.lights.length(); i++) {
+        Light light = lightBuffer.lights[i];
+
+        if (!is_in_shadow(i, rec)) {
+            vec3 light_direction = normalize(light.position - rec.p);
+            float diffuse_intensity = max(dot(rec.normal, light_direction), 0.0);
+
+            surface_color += mat.color * diffuse_intensity * light.color;
+
+            if (mat.specular == vec3(0.0)) {
+                continue; // No specular reflection
+            }
+            vec3 reflection_direction = reflect(-light_direction, rec.normal);
+            float specular_intensity = pow(max(dot(view_direction, reflection_direction), 0.0), mat.shininess);
+            surface_color += mat.specular * specular_intensity * light.color;
+        }
+    }
+
+    vec3 final_color = mat.emission + surface_color;
+
+    if (mat.transparency < 1.0) {
+        float reflectance;
+        float refraction_ratio = rec.front_face ? (1.0 / mat.refraction_index) : mat.refraction_index;
+
+        float cosine = min(dot(-ray.direction, rec.normal), 1.0);
+        float sine = sqrt(1.0 - cosine * cosine);
+
+        if (sine * refraction_ratio > 1.0) {
+            reflectance = 1.0; // Total internal reflection
+        } else {
+            reflectance = schlick(cosine, refraction_ratio);
+        }
+
+        vec3 reflection_color = vec3(0.0);
+        vec3 refraction_color = vec3(0.0);
+
+        vec3 reflection_direction = reflect(ray.direction, rec.normal);
+        Ray reflection_ray = Ray(rec.p + rec.normal * 1e-4, reflection_direction);
+        reflection_color = trace1(reflection_ray);
+
+        if (reflectance < 1.0) {
+            vec3 refraction_direction = refract(ray.direction, rec.normal, refraction_ratio);
+            Ray refraction_ray = Ray(rec.p - rec.normal * 1e-4, refraction_direction);
+            refraction_color = trace1(refraction_ray);
+        }
+
+        vec3 transmitted_color = mix(refraction_color, reflection_color, reflectance);
+        final_color = mix(transmitted_color, final_color, mat.transparency);
+    }
+    else if (mat.specular != vec3(0.0)) {
+        vec3 reflection_direction = reflect(ray.direction, rec.normal);
+        Ray reflection_ray = Ray(rec.p + rec.normal * 1e-4, reflection_direction);
+        final_color = mix(final_color, trace1(reflection_ray), mat.specular);
+    }
+
+    return clamp(final_color, 0.0, 1.0);
+}
+
+vec3 trace3(Ray ray) {
+    HitRecord rec;
+    if (!hit_closest(ray, rec)) {
+        return ubo.camera.ambient_color; // Background color
+    }
+
+    Material mat = materialBuffer.materials[rec.material_index];
+
+    vec3 surface_color = mat.ambient * ubo.camera.ambient_color;
+    vec3 view_direction = normalize(ray.origin - rec.p);
+
+    for (int i = 0; i < lightBuffer.lights.length(); i++) {
+        Light light = lightBuffer.lights[i];
+
+        if (!is_in_shadow(i, rec)) {
+            vec3 light_direction = normalize(light.position - rec.p);
+            float diffuse_intensity = max(dot(rec.normal, light_direction), 0.0);
+
+            surface_color += mat.color * diffuse_intensity * light.color;
+
+            if (mat.specular == vec3(0.0)) {
+                continue; // No specular reflection
+            }
+            vec3 reflection_direction = reflect(-light_direction, rec.normal);
+            float specular_intensity = pow(max(dot(view_direction, reflection_direction), 0.0), mat.shininess);
+            surface_color += mat.specular * specular_intensity * light.color;
+        }
+    }
+
+    vec3 final_color = mat.emission + surface_color;
+
+    if (mat.transparency < 1.0) {
+        float reflectance;
+        float refraction_ratio = rec.front_face ? (1.0 / mat.refraction_index) : mat.refraction_index;
+
+        float cosine = min(dot(-ray.direction, rec.normal), 1.0);
+        float sine = sqrt(1.0 - cosine * cosine);
+
+        if (sine * refraction_ratio > 1.0) {
+            reflectance = 1.0; // Total internal reflection
+        } else {
+            reflectance = schlick(cosine, refraction_ratio);
+        }
+
+        vec3 reflection_color = vec3(0.0);
+        vec3 refraction_color = vec3(0.0);
+
+        vec3 reflection_direction = reflect(ray.direction, rec.normal);
+        Ray reflection_ray = Ray(rec.p + rec.normal * 1e-4, reflection_direction);
+        reflection_color = trace2(reflection_ray);
+
+        if (reflectance < 1.0) {
+            vec3 refraction_direction = refract(ray.direction, rec.normal, refraction_ratio);
+            Ray refraction_ray = Ray(rec.p - rec.normal * 1e-4, refraction_direction);
+            refraction_color = trace2(refraction_ray);
+        }
+
+        vec3 transmitted_color = mix(refraction_color, reflection_color, reflectance);
+        final_color = mix(transmitted_color, final_color, mat.transparency);
+    }
+    else if (mat.specular != vec3(0.0)) {
+        vec3 reflection_direction = reflect(ray.direction, rec.normal);
+        Ray reflection_ray = Ray(rec.p + rec.normal * 1e-4, reflection_direction);
+        final_color = mix(final_color, trace2(reflection_ray), mat.specular);
+    }
+
+    return clamp(final_color, 0.0, 1.0);
+}
+
+vec3 trace4(Ray ray) {
+    HitRecord rec;
+    if (!hit_closest(ray, rec)) {
+        return ubo.camera.ambient_color; // Background color
+    }
+
+    Material mat = materialBuffer.materials[rec.material_index];
+
+    vec3 surface_color = mat.ambient * ubo.camera.ambient_color;
+    vec3 view_direction = normalize(ray.origin - rec.p);
+
+    for (int i = 0; i < lightBuffer.lights.length(); i++) {
+        Light light = lightBuffer.lights[i];
+
+        if (!is_in_shadow(i, rec)) {
+            vec3 light_direction = normalize(light.position - rec.p);
+            float diffuse_intensity = max(dot(rec.normal, light_direction), 0.0);
+
+            surface_color += mat.color * diffuse_intensity * light.color;
+
+            if (mat.specular == vec3(0.0)) {
+                continue; // No specular reflection
+            }
+            vec3 reflection_direction = reflect(-light_direction, rec.normal);
+            float specular_intensity = pow(max(dot(view_direction, reflection_direction), 0.0), mat.shininess);
+            surface_color += mat.specular * specular_intensity * light.color;
+        }
+    }
+
+    vec3 final_color = mat.emission + surface_color;
+
+    if (mat.transparency < 1.0) {
+        float reflectance;
+        float refraction_ratio = rec.front_face ? (1.0 / mat.refraction_index) : mat.refraction_index;
+
+        float cosine = min(dot(-ray.direction, rec.normal), 1.0);
+        float sine = sqrt(1.0 - cosine * cosine);
+
+        if (sine * refraction_ratio > 1.0) {
+            reflectance = 1.0; // Total internal reflection
+        } else {
+            reflectance = schlick(cosine, refraction_ratio);
+        }
+
+        vec3 reflection_color = vec3(0.0);
+        vec3 refraction_color = vec3(0.0);
+
+        vec3 reflection_direction = reflect(ray.direction, rec.normal);
+        Ray reflection_ray = Ray(rec.p + rec.normal * 1e-4, reflection_direction);
+        reflection_color = trace3(reflection_ray);
+
+        if (reflectance < 1.0) {
+            vec3 refraction_direction = refract(ray.direction, rec.normal, refraction_ratio);
+            Ray refraction_ray = Ray(rec.p - rec.normal * 1e-4, refraction_direction);
+            refraction_color = trace3(refraction_ray);
+        }
+
+        vec3 transmitted_color = mix(refraction_color, reflection_color, reflectance);
+        final_color = mix(transmitted_color, final_color, mat.transparency);
+    }
+    else if (mat.specular != vec3(0.0)) {
+        vec3 reflection_direction = reflect(ray.direction, rec.normal);
+        Ray reflection_ray = Ray(rec.p + rec.normal * 1e-4, reflection_direction);
+        final_color = mix(final_color, trace3(reflection_ray), mat.specular);
+    }
+
+    return clamp(final_color, 0.0, 1.0);
+}
+
+
+vec3 trace5(Ray ray) {
+    HitRecord rec;
+    if (!hit_closest(ray, rec)) {
+        return ubo.camera.ambient_color; // Background color
+    }
+
+    Material mat = materialBuffer.materials[rec.material_index];
+
+    vec3 surface_color = mat.ambient * ubo.camera.ambient_color;
+    vec3 view_direction = normalize(ray.origin - rec.p);
+
+    for (int i = 0; i < lightBuffer.lights.length(); i++) {
+        Light light = lightBuffer.lights[i];
+
+        if (!is_in_shadow(i, rec)) {
+            vec3 light_direction = normalize(light.position - rec.p);
+            float diffuse_intensity = max(dot(rec.normal, light_direction), 0.0);
+
+            surface_color += mat.color * diffuse_intensity * light.color;
+
+            if (mat.specular == vec3(0.0)) {
+                continue; // No specular reflection
+            }
+            vec3 reflection_direction = reflect(-light_direction, rec.normal);
+            float specular_intensity = pow(max(dot(view_direction, reflection_direction), 0.0), mat.shininess);
+            surface_color += mat.specular * specular_intensity * light.color;
+        }
+    }
+
+    vec3 final_color = mat.emission + surface_color;
+
+    if (mat.transparency < 1.0) {
+        float reflectance;
+        float refraction_ratio = rec.front_face ? (1.0 / mat.refraction_index) : mat.refraction_index;
+
+        float cosine = min(dot(-ray.direction, rec.normal), 1.0);
+        float sine = sqrt(1.0 - cosine * cosine);
+
+        if (sine * refraction_ratio > 1.0) {
+            reflectance = 1.0; // Total internal reflection
+        } else {
+            reflectance = schlick(cosine, refraction_ratio);
+        }
+
+        vec3 reflection_color = vec3(0.0);
+        vec3 refraction_color = vec3(0.0);
+
+        vec3 reflection_direction = reflect(ray.direction, rec.normal);
+        Ray reflection_ray = Ray(rec.p + rec.normal * 1e-4, reflection_direction);
+        reflection_color = trace4(reflection_ray);
+
+        if (reflectance < 1.0) {
+            vec3 refraction_direction = refract(ray.direction, rec.normal, refraction_ratio);
+            Ray refraction_ray = Ray(rec.p - rec.normal * 1e-4, refraction_direction);
+            refraction_color = trace4(refraction_ray);
+        }
+
+        vec3 transmitted_color = mix(refraction_color, reflection_color, reflectance);
+        final_color = mix(transmitted_color, final_color, mat.transparency);
+    }
+    else if (mat.specular != vec3(0.0)) {
+        vec3 reflection_direction = reflect(ray.direction, rec.normal);
+        Ray reflection_ray = Ray(rec.p + rec.normal * 1e-4, reflection_direction);
+        final_color = mix(final_color, trace4(reflection_ray), mat.specular);
+    }
+
+    return clamp(final_color, 0.0, 1.0);
+}
+
+// ========= PSEUDO-RANDOM NUMBER GENERATION =========
+
+vec2 rand2(vec2 p) {
+    return fract(
+        sin(
+            vec2(
+                dot(p, vec2(12.9898, 78.233)),
+                dot(p, vec2(39.346, 49.125))
+            )
+        ) * 43758.5453
+    );
+}
+
+// ========= MAIN PROGRAM =========
+layout (local_size_x = 32, local_size_y = 32, local_size_z = 1) in;
+
+void main() {
+    const int ANTI_ALIASING_SAMPLES = 16;
+    const int MAX_DEPTH = 5;
+
+    uvec2 pixelCoords = gl_GlobalInvocationID.xy;
+    if (pixelCoords.x >= ubo.camera.image_width || pixelCoords.y >= ubo.camera.image_height) {
+        return;
+    }
+    uint index = pixelCoords.y * ubo.camera.image_width + pixelCoords.x;
+
+    vec3 pixel_color = vec3(0.0);
+    for (int i = 0; i < ANTI_ALIASING_SAMPLES; ++i) {
+        vec2 random_offset = rand2(pixelCoords + vec2(float(i), float(ANTI_ALIASING_SAMPLES-i))) - 0.5;
+
+        vec3 pixel_center = ubo.camera.pixel_00_loc + 
+                            (ubo.camera.pixel_delta_u * pixelCoords.x) - 
+                            (ubo.camera.pixel_delta_v * pixelCoords.y);
+
+        vec3 sample_target = pixel_center + 
+                            (ubo.camera.pixel_delta_u * random_offset.x) -
+                            (ubo.camera.pixel_delta_v * random_offset.y);
+
+        vec3 ray_origin = ubo.camera.position;
+        vec3 ray_direction = normalize(sample_target - ray_origin);
+        Ray sample_ray = Ray(ray_origin, ray_direction);
+
+        pixel_color += trace4(sample_ray);
+    }
+    
+    pixel_color /= float(ANTI_ALIASING_SAMPLES);
+
+    outBuffer.imageData[index] = vec4(pixel_color, 1.0);
+}
