@@ -164,8 +164,6 @@ class PRISM_EXPORT WavyStripesTexture : public Texture {
 class PRISM_EXPORT ImageTexture : public Texture {
   public:
     ImageTexture(const std::string& filename, double scale = 1.0) : inv_scale(1.0 / scale) {
-        Prism::Style::logInfo("ImageTexture CONSTRUCTOR: Received scale = " +
-                              std::to_string(scale) + ", inv_scale = " + std::to_string(inv_scale));
         int channels_in_file;
         // Carrega a imagem e força para ter 3 canais (RGB)
         unsigned char* data = stbi_load(filename.c_str(), &width, &height, &channels_in_file, 3);
