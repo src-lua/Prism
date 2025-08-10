@@ -262,15 +262,18 @@ Scene SceneParser::parse(ACCELERATION acceleration) const {
 
         // Find the material (whether defined inline or by reference)
         std::shared_ptr<Material> material;
-        if (obj_node["material"].IsMap()) {
-            material =
+        if (obj_node["material"]) {
+
+            if (obj_node["material"].IsMap()) {
+                material =
                 parseMaterial(obj_node["material"], std::filesystem::path(filePath).parent_path());
-        } else if (obj_node["material"].IsScalar()) {
-            std::string mat_name = obj_node["material"].as<std::string>();
-            if (materials.count(mat_name)) {
-                material = materials.at(mat_name);
-            } else {
-                throw std::runtime_error("Referenced material not found: " + mat_name);
+            } else if (obj_node["material"].IsScalar()) {
+                std::string mat_name = obj_node["material"].as<std::string>();
+                if (materials.count(mat_name)) {
+                    material = materials.at(mat_name);
+                } else {
+                    throw std::runtime_error("Referenced material not found: " + mat_name);
+                }
             }
         } else {
             material = std::make_shared<Material>(); // Default material
@@ -310,9 +313,23 @@ Scene SceneParser::parse(ACCELERATION acceleration) const {
         }
     }
 
+    int faces = 0;
+    for (const auto& obj : objects) {
+        if (auto mesh = dynamic_cast<Mesh*>(obj.get())) {
+            faces += mesh->getMesh().size();
+        } else {
+            // For other object types, we can assume 1 face per object
+            faces += 1; // Sphere, Plane, Triangle
+        }
+    }
+
+
     Style::logDone("Scene parsing completed successfully.");
     Style::logInfo("Scene contains: " + Style::CYAN + std::to_string(objects.size()) +
-                   " total objects, " + std::to_string(lights.size()) + " light sources.");
+                   " total objects (with "
+                   + std::to_string(faces)
+                   + " faces), "
+                   + std::to_string(lights.size()) + " light sources.");
 
     Style::logSection();
     Style::logInfo("--- Scene Settings ---");
