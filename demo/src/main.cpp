@@ -12,8 +12,13 @@
 
 int main() {
     try {
+        Prism::Style::logInfo("FIRST TEST: Rendering with Octree acceleration.");
+        
         Prism::SceneParser("./data/input/scene.yml").parse(Prism::ACCELERATION::OCTREE).render();
-        // Prism::SceneParser("./data/input/scene.yml").parse(Prism::ACCELERATION::NONE).render();
+        
+        Prism::Style::logInfo("SECOND TEST: Rendering without acceleration.");
+
+        Prism::SceneParser("./data/input/scene.yml").parse(Prism::ACCELERATION::NONE).render();
 
     } catch (const std::exception& e) {
         Prism::Style::logError(e.what());

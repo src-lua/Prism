@@ -1,15 +1,13 @@
 # -----------------------------------------------------------------
-# Cena Complexa: "Macacos na Caixa de Cornell"
-# Um cenário de teste avançado para a aceleração com Octree.
+# Cena da Cornell Box Final - Com Esferas em Destaque (Avançadas)
 # -----------------------------------------------------------------
 
 ambient_light: [0.1, 0.1, 0.1]
 
 # --- Definições de Materiais ---
-# Usando âncoras YAML (&) para definir materiais que podem ser reutilizados (*)
 definitions:
   materials:
-    # Materiais básicos da Cornell Box
+    # Materiais das paredes
     parede_branca: &branco
       color: [0.73, 0.73, 0.73]
       ka: [0.73, 0.73, 0.73]
@@ -28,29 +26,33 @@ definitions:
       ks: [0.0, 0.0, 0.0]
       ns: 10
       
-    # Materiais avançados para os macacos
-    espelho: &espelho
+    # Materiais para os objetos internos
+    bloco_azul: &azul
+      color: [0.1, 0.2, 0.8]
+      ka: [0.1, 0.2, 0.8]
+      ks: [0.3, 0.3, 0.3]
+      ns: 64
+
+    bloco_laranja: &laranja
+      color: [0.9, 0.5, 0.1]
+      ka: [0.9, 0.5, 0.1]
+      ks: [0.2, 0.2, 0.2]
+      ns: 32
+      
+    esfera_espelho: &espelho
       color: [0.0, 0.0, 0.0]
       ka: [0.0, 0.0, 0.0]
-      ks: [0.99, 0.99, 0.99] # Altamente reflexivo
-      ns: 4096
+      ks: [0.98, 0.98, 0.98]
+      ns: 2048
 
-    vidro: &vidro
+    esfera_vidro: &vidro
       color: [1.0, 1.0, 1.0]
       ka: [1.0, 1.0, 1.0]
       ks: [0.1, 0.1, 0.1]
       ns: 256
-      ni: 1.52  # Índice de refração (como vidro)
-      d: 0.05   # Baixa opacidade (alta transparência)
+      ni: 1.52
+      d: 0.05
 
-    # Material padrão do macaco, extraído do macaco.mtl
-    macaco_laranja: &laranja_original
-      color: [0.800, 0.386, 0.073] # Cor difusa (Kd) 
-      ka: [1.0, 1.0, 1.0]           # Ambiente (Ka) 
-      ks: [0.05, 0.05, 0.05]           # Especular (Ks) 
-      ns: 250.0                     # Brilho especular (Ns) 
-
-    # Materiais com textura para as paredes e chão
     chao_xadrez: &chao_xadrez
       texture:
         type: checker
@@ -58,9 +60,9 @@ definitions:
         color1: [0.2, 0.3, 0.1]
         color2: [0.9, 0.9, 0.9]
       ka: [1.0, 1.0, 1.0]
-      ks: [0.1, 0.1, 0.1] # Um leve brilho no chão
+      ks: [0.0, 0.0, 0.0]
 
-    teto_luminoso: &teto_luminoso
+    listras_azul: &listras_azul
       texture:
         type: stripes
         scale: 50
@@ -68,19 +70,38 @@ definitions:
         color2: [0.9, 0.9, 0.9]
       ka: [1.0, 1.0, 1.0]
       ks: [0.0, 0.0, 0.0]
-      ke: [0.3, 0.3, 0.45] # Componente emissiva para simular luz
+      ke: [0.3, 0.3, 0.45]
+
+    listras_curvas: &listras_curvas
+      texture:
+        type: wavy_stripes
+        stripe_density: 1
+        wave_frequency: 0.00001
+        wave_amplitude: 1
+        color1: [0.1, 0.45, 0.1]
+        color2: [0.9, 0.9, 0.9]
+      ka: [1.0, 1.0, 1.0]
+      ks: [0.0, 0.0, 0.0]
 
     parede_tijolo: &tijolo
       texture:
         type: image
-        path: "tijolo.jpg" # Certifique-se de ter este arquivo de imagem
+        path: "tijolo.jpg"
         scale: 1000
       ka: [1.0, 1.0, 1.0]
       ks: [0.1, 0.1, 0.1]
       ns: 32
 
+    textura_esfera: &textura_esfera
+      texture:
+        type: image
+        path: "textura.jpg"
+      ka: [1.0, 1.0, 1.0]
+      ks: [0.4, 0.4, 0.4]
+      ns: 2048
+      ni: 1.5    
+
 # --- Configurações da Câmera ---
-# Posicionada para enquadrar a Cornell Box
 camera:
   image_width: 800
   image_height: 800
@@ -95,20 +116,14 @@ camera:
 lights:
   - name: Luz do Teto
     type: quad
-    corner: [343, 554.8, 250]
+    corner: [343, 554.8, 227]
     u_vec: [-130, 0, 0]
-    v_vec: [0, -10, 105]
-    color: [0.7, 0.7, 0.7]
-  - name: Luz do Teto 4
-    type: quad
-    corner: [343, 554.8, -125]
-    u_vec: [-130, 0, 0]
-    v_vec: [0, -10, 0]
-    color: [0.7, 0.7, 0.7]
+    v_vec: [0, 0, 105]
+    color: [1.0, 1.0, 1.0]
   - name: Flash da Câmera
     type: point
     position: [278, 278, -800]
-    color: [0.4, 0.4, 0.4]
+    color: [0.5, 0.5, 0.5]
 
 # --- Objetos na Cena ---
 objects:
@@ -123,7 +138,11 @@ objects:
     type: plane
     point_on_plane: [0, 555, 0]
     normal: [0, -1, 0]
-    material: *branco
+    material: *listras_azul
+    transform:
+      - type: rotation
+        angle: 90
+        axis: [0, 1, 0]
 
   - name: Parede do Fundo
     type: plane
@@ -135,7 +154,7 @@ objects:
     type: plane
     point_on_plane: [555, 0, 0]
     normal: [-1, 0, 0]
-    material: *verde
+    material: *listras_curvas
 
   - name: Parede Esquerda (Vermelha)
     type: plane
@@ -143,36 +162,41 @@ objects:
     normal: [1, 0, 0]
     material: *vermelho
 
-  # Macacos com diferentes materiais e transformações
-  # Cada macaco adiciona ~968 triângulos à cena
-  - name: Macaco Espelhado
+  # Blocos com tamanho e posição originais
+  - name: Bloco Alto (Laranja)
     type: mesh
-    path: "macaco.obj"
-    material: *espelho
+    path: "cubo.obj"
+    material: *laranja
     transform:
       - type: scaling
-        factors: [200, 200, 200]
+        factors: [82.5, 165, 82.5] 
       - type: rotation
-        angle: 20
+        angle: 18
         axis: [0, 1, 0]
       - type: translation
-        vector: [180, 300, 300]
+        vector: [180, 165, 250] 
 
-  - name: Macaco Laranja
+  - name: Bloco Baixo (Azul)
     type: mesh
-    path: "macaco.obj"
-    material: *laranja_original
+    path: "cubo.obj"
+    material: *azul
     transform:
       - type: scaling
-        factors: [140, 140, 140]
+        factors: [82.5, 82.5, 82.5]
       - type: rotation
-        angle: 160
+        angle: -20
         axis: [0, 1, 0]
       - type: translation
-        vector: [200, 70, -200]
+        vector: [370, 82.5, 150]
 
   - name: Esfera de Vidro
     type: sphere
-    center: [420, 60, 100]
-    radius: 120
+    center: [380, 90, -140] 
+    radius: 90
     material: *vidro
+
+  - name: Esfera de Espelho
+    type: sphere
+    center: [180, 90, -200]
+    radius: 90
+    material: *textura_esfera
